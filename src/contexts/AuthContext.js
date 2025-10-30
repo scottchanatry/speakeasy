@@ -1,7 +1,22 @@
 import React, { createContext, useState, useContext, useEffect } from 'react';
-import AuthService from '../services/auth';
+import { Platform } from 'react-native';
+import * as AppleAuthentication from 'expo-apple-authentication';
+import * as WebBrowser from 'expo-web-browser';
+import * as Google from 'expo-auth-session/providers/google';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import axios from 'axios';
 
 const AuthContext = createContext();
+
+// Backend configuration
+const BACKEND_URL = 'https://speakeasy-backend-823510409781.us-central1.run.app';
+
+// Google OAuth configuration
+const GOOGLE_WEB_CLIENT_ID = '823510409781-your-web-client-id.apps.googleusercontent.com';
+const GOOGLE_IOS_CLIENT_ID = '823510409781-your-ios-client-id.apps.googleusercontent.com';
+const GOOGLE_ANDROID_CLIENT_ID = '823510409781-your-android-client-id.apps.googleusercontent.com';
+
+WebBrowser.maybeCompleteAuthSession();
 
 export const useAuth = () => {
   const context = useContext(AuthContext);
@@ -15,232 +30,218 @@ export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
-  const [authError, setAuthError] = useState(null);
+  const [error, setError] = useState(null);
 
+  // Google Sign In setup
+  const [googleRequest, googleResponse, googlePromptAsync] = Google.useAuthRequest({
+    webClientId: GOOGLE_WEB_CLIENT_ID,
+    iosClientId: GOOGLE_IOS_CLIENT_ID,
+    androidClientId: GOOGLE_ANDROID_CLIENT_ID,
+  });
+
+  // Check initial auth status
   useEffect(() => {
     checkAuthStatus();
   }, []);
 
+  // Handle Google response
+  useEffect(() => {
+    if (googleResponse?.type === 'success') {
+      handleGoogleSuccess(googleResponse);
+    }
+  }, [googleResponse]);
+
   /**
-   * Check if user is authenticated on app start
+   * Check if user is already authenticated
    */
   const checkAuthStatus = async () => {
     try {
       setIsLoading(true);
-      const authenticated = await AuthService.isAuthenticated();
+      const token = await AsyncStorage.getItem('@speakeasy:authToken');
+      const userData = await AsyncStorage.getItem('@speakeasy:userData');
 
-      if (authenticated) {
-        // Validate token with backend
-        const validation = await AuthService.validateToken();
-
-        if (validation.valid) {
-          setUser(validation.user);
-          setIsAuthenticated(true);
-        } else {
-          // Token invalid, clear auth data
-          await AuthService.logout();
-          setUser(null);
-          setIsAuthenticated(false);
-        }
+      if (token && userData) {
+        const parsedUser = JSON.parse(userData);
+        setUser(parsedUser);
+        setIsAuthenticated(true);
+        console.log('✅ User authenticated from storage');
+      } else {
+        console.log('❌ No stored auth data');
       }
     } catch (error) {
-      console.error('Error checking auth status:', error);
-      setUser(null);
-      setIsAuthenticated(false);
+      console.error('Error checking auth:', error);
+      setError(error.message);
     } finally {
       setIsLoading(false);
     }
   };
 
   /**
-   * Login user
-   * @param {string} email
-   * @param {string} password
-   * @returns {Promise<{success: boolean, error?: string}>}
+   * Handle successful Google authentication
    */
-  const login = async (email, password) => {
+  const handleGoogleSuccess = async (response) => {
     try {
-      setAuthError(null);
-      const result = await AuthService.login(email, password);
+      console.log('🔵 Google auth success:', response.type);
+      const { authentication } = response;
 
-      if (result.success) {
-        setUser(result.data.user);
+      if (!authentication) {
+        throw new Error('No authentication data from Google');
+      }
+
+      // Send to backend
+      const backendResponse = await axios.post(`${BACKEND_URL}/api/auth/google`, {
+        accessToken: authentication.accessToken,
+        idToken: authentication.idToken,
+      });
+
+      if (backendResponse.data.success) {
+        const { token, user } = backendResponse.data.data;
+
+        // Save to storage
+        await AsyncStorage.setItem('@speakeasy:authToken', token);
+        await AsyncStorage.setItem('@speakeasy:userData', JSON.stringify(user));
+
+        // Update state
+        setUser(user);
         setIsAuthenticated(true);
-        return { success: true };
+        setError(null);
+
+        console.log('✅ Google Sign In successful');
       } else {
-        setAuthError(result.error);
-        return { success: false, error: result.error };
+        throw new Error(backendResponse.data.error || 'Google authentication failed');
       }
     } catch (error) {
-      const errorMessage = error.message || 'Login failed';
-      setAuthError(errorMessage);
-      return { success: false, error: errorMessage };
-    }
-  };
-
-  /**
-   * Register new user
-   * @param {string} email
-   * @param {string} password
-   * @param {string} name
-   * @returns {Promise<{success: boolean, error?: string}>}
-   */
-  const register = async (email, password, name) => {
-    try {
-      setAuthError(null);
-      const result = await AuthService.register(email, password, name);
-
-      if (result.success) {
-        setUser(result.data.user);
-        setIsAuthenticated(true);
-        return { success: true };
-      } else {
-        setAuthError(result.error);
-        return { success: false, error: result.error };
-      }
-    } catch (error) {
-      const errorMessage = error.message || 'Registration failed';
-      setAuthError(errorMessage);
-      return { success: false, error: errorMessage };
-    }
-  };
-
-  /**
-   * Logout user
-   * @returns {Promise<{success: boolean, error?: string}>}
-   */
-  const logout = async () => {
-    try {
-      const result = await AuthService.logout();
-
-      if (result.success) {
-        setUser(null);
-        setIsAuthenticated(false);
-        setAuthError(null);
-        return { success: true };
-      } else {
-        return { success: false, error: result.error };
-      }
-    } catch (error) {
-      return { success: false, error: error.message || 'Logout failed' };
-    }
-  };
-
-  /**
-   * Request password reset
-   * @param {string} email
-   * @returns {Promise<{success: boolean, error?: string}>}
-   */
-  const requestPasswordReset = async (email) => {
-    try {
-      setAuthError(null);
-      const result = await AuthService.requestPasswordReset(email);
-
-      if (!result.success) {
-        setAuthError(result.error);
-      }
-
-      return result;
-    } catch (error) {
-      const errorMessage = error.message || 'Failed to request password reset';
-      setAuthError(errorMessage);
-      return { success: false, error: errorMessage };
-    }
-  };
-
-  /**
-   * Sign in with Apple
-   * @returns {Promise<{success: boolean, error?: string}>}
-   */
-  const signInWithApple = async () => {
-    try {
-      setAuthError(null);
-      const result = await AuthService.signInWithApple();
-
-      if (result.success) {
-        setUser(result.data.user);
-        setIsAuthenticated(true);
-        return { success: true };
-      } else {
-        if (result.error !== 'User cancelled') {
-          setAuthError(result.error);
-        }
-        return { success: false, error: result.error };
-      }
-    } catch (error) {
-      const errorMessage = error.message || 'Apple Sign In failed';
-      setAuthError(errorMessage);
-      return { success: false, error: errorMessage };
+      console.error('❌ Google auth error:', error);
+      setError(error.message);
+      throw error;
     }
   };
 
   /**
    * Sign in with Google
-   * @returns {Promise<{success: boolean, error?: string}>}
    */
   const signInWithGoogle = async () => {
     try {
-      setAuthError(null);
-      const result = await AuthService.signInWithGoogle();
+      setError(null);
+      console.log('🔵 Starting Google Sign In...');
 
-      if (result.success) {
-        setUser(result.data.user);
+      if (!googleRequest) {
+        throw new Error('Google auth not initialized');
+      }
+
+      const result = await googlePromptAsync();
+
+      if (result.type === 'cancel') {
+        return { success: false, error: 'User cancelled' };
+      }
+
+      // Success case is handled by useEffect above
+      return { success: true };
+    } catch (error) {
+      console.error('❌ Google Sign In error:', error);
+      setError(error.message);
+      return { success: false, error: error.message };
+    }
+  };
+
+  /**
+   * Sign in with Apple (iOS only)
+   */
+  const signInWithApple = async () => {
+    try {
+      setError(null);
+      console.log('🍎 Starting Apple Sign In...');
+
+      const credential = await AppleAuthentication.signInAsync({
+        requestedScopes: [
+          AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+          AppleAuthentication.AppleAuthenticationScope.EMAIL,
+        ],
+      });
+
+      console.log('🍎 Apple credential received:', credential.user);
+
+      // Send to backend
+      const backendResponse = await axios.post(`${BACKEND_URL}/api/auth/apple`, {
+        identityToken: credential.identityToken,
+        user: credential.user,
+        email: credential.email,
+        fullName: credential.fullName,
+      });
+
+      if (backendResponse.data.success) {
+        const { token, user } = backendResponse.data.data;
+
+        // Save to storage
+        await AsyncStorage.setItem('@speakeasy:authToken', token);
+        await AsyncStorage.setItem('@speakeasy:userData', JSON.stringify(user));
+
+        // Update state
+        setUser(user);
         setIsAuthenticated(true);
+        setError(null);
+
+        console.log('✅ Apple Sign In successful');
         return { success: true };
       } else {
-        if (result.error !== 'User cancelled') {
-          setAuthError(result.error);
-        }
-        return { success: false, error: result.error };
+        throw new Error(backendResponse.data.error || 'Apple authentication failed');
       }
     } catch (error) {
-      const errorMessage = error.message || 'Google Sign In failed';
-      setAuthError(errorMessage);
-      return { success: false, error: errorMessage };
+      console.error('❌ Apple Sign In error:', error);
+
+      if (error.code === 'ERR_CANCELED') {
+        return { success: false, error: 'User cancelled' };
+      }
+
+      setError(error.message);
+      return { success: false, error: error.message };
     }
   };
 
   /**
    * Check if Apple Sign In is available
-   * @returns {Promise<boolean>}
    */
   const isAppleSignInAvailable = async () => {
-    return await AuthService.isAppleSignInAvailable();
+    if (Platform.OS !== 'ios') {
+      return false;
+    }
+    return await AppleAuthentication.isAvailableAsync();
   };
 
   /**
-   * Clear authentication error
+   * Logout
    */
-  const clearError = () => {
-    setAuthError(null);
-  };
+  const logout = async () => {
+    try {
+      console.log('🚪 Logging out...');
 
-  /**
-   * Update user data
-   * @param {object} userData
-   */
-  const updateUser = (userData) => {
-    setUser((prevUser) => ({
-      ...prevUser,
-      ...userData,
-    }));
+      // Clear storage
+      await AsyncStorage.removeItem('@speakeasy:authToken');
+      await AsyncStorage.removeItem('@speakeasy:userData');
+
+      // Clear state
+      setUser(null);
+      setIsAuthenticated(false);
+      setError(null);
+
+      console.log('✅ Logout successful');
+      return { success: true };
+    } catch (error) {
+      console.error('❌ Logout error:', error);
+      return { success: false, error: error.message };
+    }
   };
 
   const value = {
     user,
     isAuthenticated,
     isLoading,
-    authError,
-    login,
-    register,
-    logout,
-    signInWithApple,
+    error,
     signInWithGoogle,
+    signInWithApple,
     isAppleSignInAvailable,
-    requestPasswordReset,
-    clearError,
-    updateUser,
-    refreshAuth: checkAuthStatus,
+    logout,
+    clearError: () => setError(null),
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
